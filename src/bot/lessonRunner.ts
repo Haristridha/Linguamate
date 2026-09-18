@@ -1,30 +1,16 @@
 import { supabase, UserRow } from "@/lib/supabase";
-import { askGroqForJSON } from "@/lib/groq";
+import { askGroqForValidatedJSON } from "@/lib/groq";
 import { sendMessage, sendTyping } from "@/lib/telegram";
+import { LessonPlan, formatActivityPrompt } from "@/lib/lessonPlan";
+import { z } from "zod";
 
-type LessonPlan = {
-  objective: string;
-  focus_reason: string;
-  est_minutes: number;
-  activities: Array<{
-    type: "vocabulary" | "grammar" | "reading" | "conversation";
-    prompt: string;
-    target_answer?: string;
-    new_word?: {
-      word: string;
-      translation_id: string;
-      definition_en: string;
-      example_sentence: string;
-    };
-  }>;
-};
-
-type CorrectionResult = {
-  is_correct: boolean;
-  feedback_id: string; // short, casual, in Indonesian
-  mistake_type: string | null; // snake_case tag, or null if no mistake
-  corrected_sentence: string | null;
-};
+const CorrectionResultSchema = z.object({
+  is_correct: z.boolean(),
+  feedback_id: z.string().min(1), // short, casual, in Indonesian
+  mistake_type: z.string().min(1).nullable(),
+  corrected_sentence: z.string().min(1).nullable(),
+});
+type CorrectionResult = z.infer<typeof CorrectionResultSchema>;
 
 /**
  * Called whenever the user sends free text and they have an in-progress
@@ -54,18 +40,19 @@ export async function handleLessonResponse(user: UserRow, text: string) {
     // Open-ended: just acknowledge naturally and move on, no strict scoring.
     await sendMessage(user.telegram_chat_id, "Nice, jawaban yang natural 👍");
   } else {
-    const correction = await askGroqForJSON<CorrectionResult>({
+    const correction = await askGroqForValidatedJSON<CorrectionResult>({
       userId: user.id,
       endpoint: "answer_correction",
+      schema: CorrectionResultSchema,
       system:
         "You are a friendly, casual English tutor for Indonesian learners. Evaluate the learner's answer briefly and kindly. Never lecture — one or two sentences max, in Indonesian, casual tone.",
-      prompt: `Activity prompt: "${activity.prompt}"\nExpected/target idea: "${activity.target_answer ?? "(open-ended, use judgment)"}"\nLearner's answer: "${text}"\n\nReturn JSON: {"is_correct": bool, "feedback_id": "short casual Indonesian feedback", "mistake_type": "snake_case tag or null", "corrected_sentence": "corrected version or null"}`,
+      prompt: `Activity prompt: "${activity.prompt}"\nExpected/target idea: "${activity.target_answer ?? "(open-ended, use judgment)"}"\nLearner's answer: "${text}"\n\nReturn JSON: {"is_correct": bool, "feedback_id": "short casual Indonesian feedback (never empty)", "mistake_type": "snake_case tag or null", "corrected_sentence": "corrected version or null"}`,
     });
 
     await sendMessage(
       user.telegram_chat_id,
       correction.feedback_id +
-        (correction.corrected_sentence ? `\n<i>${correction.corrected_sentence}</i>` : "")
+      (correction.corrected_sentence ? `\n<i>${correction.corrected_sentence}</i>` : "")
     );
 
     if (!correction.is_correct && correction.mistake_type) {
@@ -161,11 +148,4 @@ async function updateStreak(user: UserRow) {
       last_active_date: today,
     })
     .eq("id", user.id);
-}
-
-function formatActivityPrompt(activity: LessonPlan["activities"][number]) {
-  if (activity.type === "vocabulary" && activity.new_word) {
-    return `Kata baru: <b>"${activity.new_word.word}"</b> — ${activity.new_word.translation_id}\nContoh: "${activity.new_word.example_sentence}"\n\n${activity.prompt}`;
-  }
-  return activity.prompt;
 }

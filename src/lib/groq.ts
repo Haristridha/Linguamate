@@ -1,4 +1,5 @@
 import Groq from "groq-sdk";
+import { z } from "zod";
 import { supabase } from "./supabase";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -134,4 +135,41 @@ export async function askGroqForText(params: {
 
     return res.choices[0]?.message?.content ?? "";
   });
+}
+
+/**
+ * Same as askGroqForJSON, but validates the result against a Zod schema.
+ * Open-weight models (unlike bigger hosted models) are more likely to
+ * drop a field or invent a slightly different shape, so we don't trust
+ * "valid JSON" to mean "valid for our code" — if validation fails, we
+ * retry once with the specific errors fed back to the model. If it still
+ * doesn't match, we throw rather than silently rendering "undefined" to
+ * the user.
+ */
+export async function askGroqForValidatedJSON<T>(params: {
+  system: string;
+  prompt: string;
+  schema: z.ZodType<T>;
+  userId?: string;
+  endpoint: string;
+  maxTokens?: number;
+}): Promise<T> {
+  const { schema, prompt, ...rest } = params;
+
+  const raw = await askGroqForJSON<unknown>({ ...rest, prompt });
+  const parsed = schema.safeParse(raw);
+  if (parsed.success) return parsed.data;
+
+  console.warn(`${rest.endpoint}: schema validation failed, retrying once`, parsed.error.issues);
+
+  const correctionPrompt = `${prompt}\n\nYour previous response did not match the required schema. Validation errors: ${JSON.stringify(
+    parsed.error.issues.slice(0, 5)
+  )}\n\nReturn corrected JSON only, matching the schema exactly. Every required field must be a real, non-empty, meaningful value — never a placeholder like "undefined" or an empty string.`;
+
+  const retryRaw = await askGroqForJSON<unknown>({ ...rest, prompt: correctionPrompt });
+  const retryParsed = schema.safeParse(retryRaw);
+  if (retryParsed.success) return retryParsed.data;
+
+  console.error(`${rest.endpoint}: schema validation failed again after retry`, retryParsed.error.issues);
+  throw new Error(`AI_SCHEMA_VALIDATION_FAILED: ${rest.endpoint}`);
 }

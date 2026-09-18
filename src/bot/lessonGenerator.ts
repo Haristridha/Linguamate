@@ -1,29 +1,14 @@
 import { supabase, UserRow } from "@/lib/supabase";
-import { askGroqForJSON } from "@/lib/groq";
+import { askGroqForValidatedJSON } from "@/lib/groq";
 import { sendMessage } from "@/lib/telegram";
-
-type LessonPlan = {
-  objective: string;
-  focus_reason: string;
-  est_minutes: number;
-  activities: Array<{
-    type: "vocabulary" | "grammar" | "reading" | "conversation";
-    prompt: string;
-    target_answer?: string;
-    new_word?: {
-      word: string;
-      translation_id: string;
-      definition_en: string;
-      example_sentence: string;
-    };
-  }>;
-};
+import { LessonPlan, LessonPlanSchema, formatActivityPrompt } from "@/lib/lessonPlan";
 
 /**
  * Builds today's lesson: pulls recent mistakes + due vocabulary as context,
- * asks Claude for a short structured plan, stores it, and sends the first
- * activity to the user. Subsequent activities are delivered as the user
- * responds (see lessonRunner.ts).
+ * asks the model for a short structured plan (validated against
+ * LessonPlanSchema, with an automatic retry if the shape is off), stores
+ * it, and sends the first activity to the user. Subsequent activities are
+ * delivered as the user responds (see lessonRunner.ts).
  */
 export async function generateAndSendDailyLesson(user: UserRow) {
   const today = new Date().toISOString().slice(0, 10);
@@ -55,13 +40,30 @@ export async function generateAndSendDailyLesson(user: UserRow) {
     .lte("next_review_at", today)
     .limit(5);
 
-  const wordCount = wordsPerDay(user.daily_duration_minutes);
-
-  const plan = await askGroqForJSON<LessonPlan>({
+  const plan = await askGroqForValidatedJSON<LessonPlan>({
     userId: user.id,
     endpoint: "lesson_generation",
-    system: `You are LinguaMate, a friendly English tutor for Indonesian learners. Write lesson content mixing English (target language) with Indonesian explanations, matching a casual "ngobrol santai" tone. Keep everything short — this is delivered as chat messages, not a document. Lessons must be 1-3 small activities only, never a long lecture.`,
-    prompt: `Learner level: ${user.level_band}\nMain goal: ${user.main_goal}\nDaily time available: ${user.daily_duration_minutes} minutes\nRecurring mistakes to address: ${JSON.stringify(recentMistakes ?? [])}\nVocabulary due for review today: ${JSON.stringify(dueVocab ?? [])}\nNew words to introduce today: ${wordCount}\n\nReturn JSON matching this shape:\n{\n  "objective": "short learning objective",\n  "focus_reason": "one short sentence explaining to the learner, in Indonesian, why today's lesson focuses on this",\n  "est_minutes": number,\n  "activities": [\n    {"type":"vocabulary","prompt":"...","new_word":{"word":"...","translation_id":"...","definition_en":"...","example_sentence":"..."}},\n    {"type":"grammar","prompt":"...","target_answer":"..."},\n    {"type":"conversation","prompt":"..."}\n  ]\n}`,
+    schema: LessonPlanSchema,
+    system: `You are LinguaMate, a friendly English tutor for Indonesian learners. Write lesson content mixing English (target language) with Indonesian explanations, matching a casual "ngobrol santai" tone. Keep everything short — this is delivered as chat messages, not a document.`,
+    prompt: `Learner level: ${user.level_band}
+Main goal: ${user.main_goal}
+Daily time available: ${user.daily_duration_minutes} minutes
+Recurring mistakes to address: ${JSON.stringify(recentMistakes ?? [])}
+Vocabulary already due for spaced-repetition review today (do NOT re-teach these here, they are reviewed separately via /review): ${JSON.stringify(dueVocab ?? [])}
+
+Build a lesson plan with 1 to 3 short activities total (never more than 3 — this is a chat message flow, not a document). At most ONE activity may be type "vocabulary", and if you include one, it introduces exactly ONE new word (not a list). Every field in new_word must be filled with a real, specific, non-empty value — never "undefined" or a placeholder.
+
+Return JSON matching this exact shape:
+{
+  "objective": "short learning objective",
+  "focus_reason": "one short sentence in Indonesian explaining why today's lesson focuses on this",
+  "est_minutes": 15,
+  "activities": [
+    {"type":"vocabulary","prompt":"instruction asking the learner to use the word in a sentence","new_word":{"word":"deadline","translation_id":"tenggat waktu","definition_en":"the time or day by which something must be done","example_sentence":"The deadline is next Friday."}},
+    {"type":"grammar","prompt":"a short grammar exercise as a question","target_answer":"the expected correct answer"},
+    {"type":"conversation","prompt":"an open-ended conversational question"}
+  ]
+}`,
     maxTokens: 1500,
   });
 
@@ -80,7 +82,7 @@ export async function generateAndSendDailyLesson(user: UserRow) {
 
   if (error) throw error;
 
-  // Insert any brand-new vocabulary items introduced in this lesson.
+  // Insert any brand-new vocabulary item introduced in this lesson.
   for (const activity of plan.activities) {
     if (activity.type === "vocabulary" && activity.new_word) {
       await supabase.from("vocabulary_items").insert({
@@ -106,17 +108,4 @@ async function sendLessonIntro(user: UserRow, focusReason: string, plan: LessonP
   if (first) {
     await sendMessage(user.telegram_chat_id, formatActivityPrompt(first));
   }
-}
-
-function formatActivityPrompt(activity: LessonPlan["activities"][number]) {
-  if (activity.type === "vocabulary" && activity.new_word) {
-    return `Kata baru: <b>"${activity.new_word.word}"</b> — ${activity.new_word.translation_id}\nContoh: "${activity.new_word.example_sentence}"\n\n${activity.prompt}`;
-  }
-  return activity.prompt;
-}
-
-function wordsPerDay(minutes: number): number {
-  if (minutes <= 15) return 5;
-  if (minutes <= 20) return 7;
-  return 10;
 }

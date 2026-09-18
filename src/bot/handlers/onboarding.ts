@@ -1,6 +1,7 @@
 import { supabase, UserRow } from "@/lib/supabase";
 import { sendMessage, sendTyping } from "@/lib/telegram";
-import { askGroqForJSON } from "@/lib/groq";
+import { askGroqForValidatedJSON } from "@/lib/groq";
+import { z } from "zod";
 import { generateAndSendDailyLesson } from "@/bot/lessonGenerator";
 
 /**
@@ -51,7 +52,7 @@ export async function getOnboardingState(userId: string) {
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
-  return (data?.meta as { state: string; [k: string]: unknown }) ?? null;
+  return (data?.meta as { state: string;[k: string]: unknown }) ?? null;
 }
 
 /** Handles a button press during onboarding (assessment MCQ, time/duration/goal picks). */
@@ -171,13 +172,16 @@ export async function handleOnboardingText(user: UserRow, state: string, text: s
   }
 }
 
+const AssessmentResultSchema = z.object({
+  level_band: z.enum(["beginner", "lower_intermediate", "intermediate", "upper_intermediate"]),
+  weak_areas: z.array(z.string().min(1)),
+  strengths: z.array(z.string().min(1)),
+});
+
 async function scoreAssessment(input: { q1Correct: boolean; q2HasPast: boolean; q3Answer: string }) {
-  return askGroqForJSON<{
-    level_band: "beginner" | "lower_intermediate" | "intermediate" | "upper_intermediate";
-    weak_areas: string[];
-    strengths: string[];
-  }>({
+  return askGroqForValidatedJSON<z.infer<typeof AssessmentResultSchema>>({
     endpoint: "assessment_scoring",
+    schema: AssessmentResultSchema,
     system:
       "You are an English placement test evaluator for Indonesian learners. Classify the learner into a level band and list weak areas / strengths using short snake_case tags (e.g. simple_past, reading_comprehension, vocabulary_range).",
     prompt: `Grammar MCQ correct: ${input.q1Correct}\nPast-tense sentence used correctly: ${input.q2HasPast}\nReading comprehension answer: "${input.q3Answer}"\n\nReturn JSON: {"level_band": "...", "weak_areas": ["..."], "strengths": ["..."]}`,
