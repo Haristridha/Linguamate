@@ -1,5 +1,5 @@
 import { supabase, UserRow } from "@/lib/supabase";
-import { askGroqForValidatedJSON } from "@/lib/groq";
+import { askGroqForValidatedJSON, askGroqForText } from "@/lib/groq";
 import { sendMessage, sendTyping } from "@/lib/telegram";
 import { LessonPlan, formatActivityPrompt } from "@/lib/lessonPlan";
 import { z } from "zod";
@@ -11,6 +11,18 @@ const CorrectionResultSchema = z.object({
   corrected_sentence: z.string().min(1).nullable(),
 });
 type CorrectionResult = z.infer<typeof CorrectionResultSchema>;
+
+/**
+ * Rough heuristic for "the user is asking something" rather than
+ * "the user is answering the current activity". Not perfect, but good
+ * enough to stop clarifying questions from being silently swallowed as
+ * if they were the next activity's answer.
+ */
+function isLikelyQuestion(text: string): boolean {
+  const t = text.trim();
+  if (t.endsWith("?")) return true;
+  return /^(kenapa|mengapa|apa|gimana|bagaimana|maksudnya|bisa jelaskan|coba jelaskan|jelaskan|kok)\b/i.test(t);
+}
 
 /**
  * Called whenever the user sends free text and they have an in-progress
@@ -36,9 +48,49 @@ export async function handleLessonResponse(user: UserRow, text: string) {
 
   await sendTyping(user.telegram_chat_id);
 
+  // If this looks like a question rather than an answer, address it
+  // directly and leave the current activity pending — don't advance.
+  if (isLikelyQuestion(text)) {
+    const contextActivity = activityIndex > 0 ? plan.activities[activityIndex - 1] : activity;
+    const clarification = await askGroqForText({
+      userId: user.id,
+      endpoint: "lesson_clarification",
+      system:
+        "You are a friendly, casual English tutor for Indonesian learners answering a quick clarifying question mid-lesson. Answer in Indonesian, casual tone, 2-4 sentences max. Be concrete. Do not restart the lesson, do not ask a new question of your own, and do not repeat the full earlier explanation verbatim — build on it.",
+      prompt: `Earlier activity: "${contextActivity.prompt}"${contextActivity.target_answer ? `\nExpected idea: "${contextActivity.target_answer}"` : ""}\nLearner's clarifying question: "${text}"`,
+      maxTokens: 300,
+    });
+
+    await sendMessage(user.telegram_chat_id, clarification);
+    await sendMessage(
+      user.telegram_chat_id,
+      `Oke, balik ke tadi ya:\n${activity.prompt}`
+    );
+
+    await supabase.from("conversation_log").insert([
+      {
+        user_id: user.id,
+        role: "user",
+        content: text,
+        meta: { lesson_id: lesson.id, activity_index: activityIndex, type: "clarification" },
+      },
+    ]);
+
+    return true;
+  }
+
   if (activity.type === "conversation") {
-    // Open-ended: just acknowledge naturally and move on, no strict scoring.
-    await sendMessage(user.telegram_chat_id, "Nice, jawaban yang natural 👍");
+    // Open-ended, but still worth a real reaction instead of a canned line —
+    // acknowledge something specific from what they actually said.
+    const reply = await askGroqForText({
+      userId: user.id,
+      endpoint: "conversation_reaction",
+      system:
+        "You are a friendly, casual English tutor for Indonesian learners. React briefly and specifically to what the learner just said (1-2 sentences, Indonesian, casual). If their English had a small error, note it gently in passing — don't turn it into a full lecture. Never use a generic line like 'jawaban yang natural' — react to the actual content.",
+      prompt: `Activity prompt: "${activity.prompt}"\nLearner's answer: "${text}"`,
+      maxTokens: 200,
+    });
+    await sendMessage(user.telegram_chat_id, reply);
   } else {
     const correction = await askGroqForValidatedJSON<CorrectionResult>({
       userId: user.id,
@@ -52,7 +104,7 @@ export async function handleLessonResponse(user: UserRow, text: string) {
     await sendMessage(
       user.telegram_chat_id,
       correction.feedback_id +
-      (correction.corrected_sentence ? `\n<i>${correction.corrected_sentence}</i>` : "")
+        (correction.corrected_sentence ? `\n<i>${correction.corrected_sentence}</i>` : "")
     );
 
     if (!correction.is_correct && correction.mistake_type) {
